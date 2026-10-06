@@ -17,8 +17,8 @@ cat > "$app/Contents/Info.plist" <<'EOF'
 <key>CFBundleExecutable</key><string>NOIDMiner</string>
 <key>CFBundleIdentifier</key><string>local.noid.metalminer</string>
 <key>CFBundleName</key><string>NOID Miner</string>
-<key>CFBundleVersion</key><string>3</string>
-<key>CFBundleShortVersionString</key><string>0.3.0</string>
+<key>CFBundleVersion</key><string>4</string>
+<key>CFBundleShortVersionString</key><string>0.4.0</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
@@ -27,4 +27,4 @@ EOF
 codesign --force --deep --sign - "$app"
 codesign --verify --deep --strict "$app"
 ditto -c -k --sequesterRsrc --keepParent "$app" dist/NOID-Miner-AppleSilicon.zip
-shasum -a 256 dist/NOID-Miner-AppleSilicon.zip > dist/SHA256SUMS
+(cd dist && shasum -a 256 NOID-Miner-AppleSilicon.zip > SHA256SUMS)

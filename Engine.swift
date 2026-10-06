@@ -34,12 +34,32 @@ struct PoolJob {
  }
  var prefixValue:UInt64 {hexData(prefix)!.enumerated().reduce(0){$0 | UInt64($1.element)<<($1.offset*8)}}
 }
+enum LoadPolicy {
+ static func duty(percent:Int,thermal:ProcessInfo.ThermalState,protect:Bool)->Double {
+  let requested=Double(min(100,max(10,percent)))/100
+  guard protect else{return requested}
+  if thermal == .critical {return 0}
+  if thermal == .serious {return min(requested,0.5)}
+  return requested
+ }
+ static func pauseSeconds(busy:Double,duty:Double)->Double {guard duty>0 else{return 0};return max(0,busy*(1/duty-1))}
+ static func retryDelay(_ attempt:Int)->Double {min(30,pow(2,Double(min(5,max(1,attempt)))))}
+ static func thermalLabel(_ state:ProcessInfo.ThermalState)->String {
+  switch state{case .nominal:return "正常";case .fair:return "温热";case .serious:return "过热，降低负载";case .critical:return "严重过热，暂停计算";@unknown default:return "未知"}
+ }
+}
 final class HashProcess {
- let process=Process(),input=Pipe(),output=Pipe()
+ let process=Process(),input=Pipe(),output=Pipe(),errors=Pipe(),errorLock=NSLock()
  var pending=Data()
- init(executable:URL,directory:URL) throws {
+ var errorText=""
+ init(executable:URL,directory:URL,threads:Int=1) throws {
   process.executableURL=executable;process.currentDirectoryURL=directory
-  process.standardInput=input;process.standardOutput=output;process.standardError=FileHandle.standardError
+  var environment=ProcessInfo.processInfo.environment;environment["RAYON_NUM_THREADS"]=String(max(1,threads));process.environment=environment
+  process.standardInput=input;process.standardOutput=output;process.standardError=errors
+  errors.fileHandleForReading.readabilityHandler={[weak self] handle in
+   let data=handle.availableData;guard !data.isEmpty,let self=self else{handle.readabilityHandler=nil;return}
+   self.errorLock.lock();self.errorText=String((self.errorText+String(decoding:data,as:UTF8.self)).suffix(4096));self.errorLock.unlock()
+  }
   try process.run()
  }
  func call(_ request:[String:Any]) throws -> [String:Any] {
@@ -50,7 +70,7 @@ final class HashProcess {
    var bytes=[UInt8](repeating:0,count:65536)
    let n=bytes.withUnsafeMutableBytes {Darwin.read(output.fileHandleForReading.fileDescriptor,$0.baseAddress!,$0.count)}
    if n<0 {if errno==EINTR {continue};throw MinerError.message("计算管道读取失败")}
-   if n==0 {throw MinerError.message("计算进程已退出")};pending.append(contentsOf:bytes.prefix(n))
+   if n==0 {errorLock.lock();let reason=errorText.trimmingCharacters(in:.whitespacesAndNewlines);errorLock.unlock();throw MinerError.message("计算进程已退出"+(reason.isEmpty ? "":"："+reason))};pending.append(contentsOf:bytes.prefix(n))
    if pending.count>8_000_000 {throw MinerError.message("计算输出异常")}
   }
  }
@@ -62,6 +82,7 @@ final class PoolSession {
  let lock=NSLock()
  var buffer=Data(),job:PoolJob?,authorized=false,namespace:String?,ended=false
  var submitID=100
+ var retryable=false,failureReason="",lastMessage=ProcessInfo.processInfo.systemUptime
  let username:String,event:(String)->Void,share:(Bool,Bool)->Void
  init(wallet:String,worker:String,event:@escaping(String)->Void,share:@escaping(Bool,Bool)->Void) {
   username=wallet+"."+worker;self.event=event;self.share=share
@@ -71,24 +92,24 @@ final class PoolSession {
   connection.stateUpdateHandler={[weak self] state in
    guard let self=self else{return}
    switch state {
-   case .ready:self.event("TLS 已连接 InnovLab");self.send(["id":1,"method":"mining.subscribe","params":["noid-metal-mac/0.1"]]);self.receive()
-   case .failed(let e):self.fail("矿池连接失败：\(e)")
+   case .ready:self.event("TLS 已连接 InnovLab");self.send(["id":1,"method":"mining.subscribe","params":["noid-metal-mac/0.4"]]);self.receive()
+   case .failed(let e):self.fail("矿池连接失败：\(e)",retry:true)
    default:break
    }
   };connection.start(queue:queue)
  }
  func send(_ v:[String:Any]) {
   guard let data=try? JSONSerialization.data(withJSONObject:v) else{return}
-  connection.send(content:data+Data([10]),completion:.contentProcessed{[weak self] error in if let error=error {self?.fail("发送失败：\(error)")}})
+  connection.send(content:data+Data([10]),completion:.contentProcessed{[weak self] error in if let error=error {self?.fail("发送失败：\(error)",retry:true)}})
  }
  func receive() {
   connection.receive(minimumIncompleteLength:1,maximumLength:65536){[weak self] data,_,complete,error in
    guard let self=self else{return}
-   if let data=data {self.buffer.append(data);if self.buffer.count>1_000_000 {self.fail("矿池消息过大");return}
+   if let data=data {self.lock.lock();self.lastMessage=ProcessInfo.processInfo.systemUptime;self.lock.unlock();self.buffer.append(data);if self.buffer.count>1_000_000 {self.fail("矿池消息过大");return}
     while let n=self.buffer.firstIndex(of:10){let line=self.buffer.prefix(upTo:n);self.buffer.removeSubrange(...n);do{try self.handle(line)}catch{self.fail("矿池协议异常：\(error)");return}}
    }
-   if let error=error {self.fail("矿池断开：\(error)")}
-   else if complete {self.fail("矿池已关闭连接")}
+   if let error=error {self.fail("矿池断开：\(error)",retry:true)}
+   else if complete {self.fail("矿池已关闭连接",retry:true)}
    else {self.receive()}
   }
  }
@@ -125,23 +146,37 @@ final class PoolSession {
   let lo=(0..<8).map{String(format:"%02x",(nonce>>($0*8))&255)}.joined()
   send(["id":id,"method":"mining.submit","params":[old.id,lo+old.prefix,old.domain]])
  }
- func fail(_ message:String){lock.lock();let was=ended;ended=true;job=nil;lock.unlock();if !was {event(message)};connection.cancel()}
+ func failure()->(Bool,String){lock.lock();defer{lock.unlock()};return(retryable,failureReason)}
+ func checkDeadline(){lock.lock();let age=ProcessInfo.processInfo.systemUptime-lastMessage,ready=authorized;lock.unlock();if age>(ready ? 180:45){fail(ready ? "矿池 180 秒无消息":"矿池握手超时",retry:true)}}
+ func fail(_ message:String,retry:Bool=false){lock.lock();let was=ended;if !was{ended=true;job=nil;retryable=retry;failureReason=message};lock.unlock();if !was {event(message)};connection.cancel()}
  func stop(){lock.lock();ended=true;job=nil;lock.unlock();connection.cancel()}
 }
 final class MiningWorker {
  let lock=NSLock(),gpu:Bool,directory:URL
  var stopped=false,session:PoolSession?,hasher:HashProcess?,oracle:HashProcess?
  let event:(String)->Void,rate:(Double)->Void,share:(Bool,Bool)->Void,done:()->Void
- init(gpu:Bool,directory:URL,event:@escaping(String)->Void,rate:@escaping(Double)->Void,share:@escaping(Bool,Bool)->Void,done:@escaping()->Void){self.gpu=gpu;self.directory=directory;self.event=event;self.rate=rate;self.share=share;self.done=done}
+ let cpuThreads:Int,load:()->(Int,Bool)
+ var lastThermal:ProcessInfo.ThermalState?
+ init(gpu:Bool,directory:URL,cpuThreads:Int=4,load:@escaping()->(Int,Bool)={ (70,true) },event:@escaping(String)->Void,rate:@escaping(Double)->Void,share:@escaping(Bool,Bool)->Void,done:@escaping()->Void){self.gpu=gpu;self.directory=directory;self.cpuThreads=min(ProcessInfo.processInfo.activeProcessorCount,max(1,cpuThreads));self.load=load;self.event=event;self.rate=rate;self.share=share;self.done=done}
  func isStopped()->Bool{lock.lock();defer{lock.unlock()};return stopped}
+ func wait(_ seconds:Double)->Bool {
+  let end=ProcessInfo.processInfo.systemUptime+max(0,seconds)
+  while !isStopped() && ProcessInfo.processInfo.systemUptime<end {Thread.sleep(forTimeInterval:min(0.05,max(0,end-ProcessInfo.processInfo.systemUptime)))}
+  return !isStopped()
+ }
+ func duty()->Double {
+  let (percent,protect)=load(),thermal=ProcessInfo.processInfo.thermalState
+  if lastThermal != thermal {lastThermal=thermal;if protect && (thermal == .serious || thermal == .critical){event("系统散热状态：\(LoadPolicy.thermalLabel(thermal))")}else if protect{event("系统散热状态：\(LoadPolicy.thermalLabel(thermal))")}}
+  return LoadPolicy.duty(percent:gpu ? percent:100,thermal:thermal,protect:protect)
+ }
  func start(wallet:String,worker:String) {
   DispatchQueue.global(qos:.userInitiated).async{[self] in
    defer{stop();done()}
    do {
-    let h=try HashProcess(executable:directory.appendingPathComponent(gpu ? "bin/noid-metal":"bin/noid-cpu"),directory:directory)
+    let h=try HashProcess(executable:directory.appendingPathComponent(gpu ? "bin/noid-metal":"bin/noid-cpu"),directory:directory,threads:gpu ? 1:cpuThreads)
     let o=gpu ? try HashProcess(executable:directory.appendingPathComponent("bin/noid-cpu"),directory:directory):h
-    let s=PoolSession(wallet:wallet,worker:worker,event:event,share:share)
-    lock.lock();hasher=h;oracle=o;session=s;lock.unlock()
+    lock.lock();hasher=h;oracle=o;lock.unlock()
+    event(gpu ? "GPU 目标强度 \(load().0)%（计算占空比）":"CPU 使用 \(cpuThreads) 个线程")
     guard !isStopped() else{return}
     if gpu {
      let check:[String:Any]=["header":String(repeating:"00",count:256),"count":16,"base":"4294967290","prefix":"123456789","digests":true]
@@ -149,29 +184,45 @@ final class MiningWorker {
      guard actual["digests"] as? [String]==expected["digests"] as? [String] else{throw MinerError.message("GPU 启动校验不通过")}
      event("GPU / 官方 CPU 启动校验通过")
     }
-    guard !isStopped() else{return};s.start()
-    var last="",prepared:[String:Any]=[:],base:UInt64=0,hashes=0,lastReport=Date(),started=Date()
+    var s:PoolSession?,attempt=0,last="",prepared:[String:Any]=[:],base:UInt64=0,hashes=0,lastReport=Date(),started=Date(),sessionStarted=ProcessInfo.processInfo.systemUptime
     while !isStopped() {
-     let (candidate,authorized,ended)=s.current();if ended {break}
+     if s == nil {
+      let fresh=PoolSession(wallet:wallet,worker:worker,event:event,share:share)
+      lock.lock();session=fresh;lock.unlock();if isStopped(){fresh.stop();break}
+      fresh.start();s=fresh;sessionStarted=ProcessInfo.processInfo.systemUptime;last="";base=0;prepared=[:];hashes=0;started=Date();lastReport=Date()
+     }
+     guard let pool=s else{continue};pool.checkDeadline()
+     let (candidate,authorized,ended)=pool.current()
+     if ended {
+      let (retry,reason)=pool.failure();pool.stop();s=nil;rate(0)
+      if !retry {throw MinerError.message(reason.isEmpty ? "矿池会话已停止":reason)}
+      attempt+=1;let delay=LoadPolicy.retryDelay(attempt);event("临时连接中断，\(Int(delay)) 秒后重连；手动停止可取消")
+      if !wait(delay){break};continue
+     }
      guard authorized,let job=candidate,job.expires>Date() else{Thread.sleep(forTimeInterval:0.05);continue}
+     if ProcessInfo.processInfo.systemUptime-sessionStarted>30 {attempt=0}
+     let targetDuty=duty();if targetDuty==0 {rate(0);if !wait(0.25){break};continue}
+     let batchStarted=ProcessInfo.processInfo.systemUptime
      if job.id != last {last=job.id;base=0;prepared=gpu ? try o.call(["header":job.header,"prepare":true]):[:]}
      let count=gpu ? 262144:16384
      if base>UInt64.max-UInt64(count){throw MinerError.message("nonce 范围耗尽")}
      var request:[String:Any]=["header":job.header,"count":count,"base":String(base),"prefix":String(job.prefixValue),"target":job.target]
      for (k,v) in prepared {request[k]=v}
      let output=try h.call(request)
+     if !gpu,output["threads"] as? Int != cpuThreads {throw MinerError.message("CPU 线程限制未生效")}
      guard let nonces=output["nonces"] as? [String] else{throw MinerError.message("计算输出缺少候选份额")}
      hashes+=count;base+=UInt64(count)
      if Date().timeIntervalSince(lastReport)>2 {rate(Double(hashes)/Date().timeIntervalSince(started));lastReport=Date()}
-     if s.current().0?.id != job.id || job.expires<=Date(){continue}
-     for text in nonces {
+     if pool.current().0?.id == job.id && job.expires>Date(){for text in nonces {
       guard let nonce=UInt64(text) else{throw MinerError.message("无效 nonce")}
       if gpu {
        let proof=try o.call(["header":job.header,"count":1,"base":text,"prefix":String(job.prefixValue),"target":job.target])
        guard proof["nonces"] as? [String]==[text] else{throw MinerError.message("GPU 候选与官方 CPU 算法不一致")}
       }
-      if !isStopped(){s.submit(nonce,for:job)}
-     }
+      if !isStopped(){pool.submit(nonce,for:job)}
+     }}
+     let pause=LoadPolicy.pauseSeconds(busy:ProcessInfo.processInfo.systemUptime-batchStarted,duty:targetDuty)
+     if !wait(pause){break}
     }
    } catch {if !isStopped(){event("已停止：\(error)")}}
   }

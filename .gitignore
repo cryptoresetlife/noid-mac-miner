@@ -1,0 +1,10 @@
+source/
+oracle/target/
+bin/
+dist/
+*.bin
+tower-small.metal
+*-SHA256SUMS
+*-validation.json
+.DS_Store
+*.log

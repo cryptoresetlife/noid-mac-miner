@@ -51,7 +51,7 @@ fn main() {
    let target=hex::decode(t).unwrap();assert_eq!(target.len(),32);
    let nonces:Vec<String>=out.iter().enumerate().filter(|(_,d)|d.iter().rev().cmp(target.iter().rev())==std::cmp::Ordering::Less).map(|(i,_)|(base+i as u64).to_string()).collect();
    let seconds=start.elapsed().as_secs_f64();
-   println!("{}",serde_json::json!({"nonces":nonces,"seconds":seconds,"hashrate":count as f64/seconds,"count":count}));
+   println!("{}",serde_json::json!({"nonces":nonces,"seconds":seconds,"hashrate":count as f64/seconds,"count":count,"threads":rayon::current_num_threads()}));
   } else {println!("{}",serde_json::json!({"digests":out.iter().map(hex::encode).collect::<Vec<_>>()}));}
  }
 }
